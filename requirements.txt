@@ -1,0 +1,15 @@
+abtem==1.0.11
+ase==3.29.0
+dask==2026.8.0
+h5py==3.16.0
+hankel==1.2.2
+ipykernel==7.4.0
+matplotlib==3.11.2
+nbconvert==7.16.6
+notebook==7.4.7
+numpy==2.5.5
+pillow==13.0.0
+pypng==0.20220715.0
+scipy==1.18.1
+torch==2.8.0
+tqdm==4.70.1
