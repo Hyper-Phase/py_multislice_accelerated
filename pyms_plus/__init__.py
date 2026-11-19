@@ -22,3 +22,5 @@ from .atomic_scattering_params import *  # noqa
 from .structure_routines import *  # noqa
 from .Ionization import *  # noqa
 from .Premixed_routines import *  # noqa
+from .density_matrix import calculate_dm  # noqa
+from .density_matrix_setup import StructureASE, load_structure  # noqa

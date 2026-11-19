@@ -1328,6 +1328,7 @@ class scattering_matrix:
         subslicing=False,
         transposed=False,
         stored_gridshape=None,
+        progress_callback=None,
     ):
         """
         Initialize with a set of propagators and transmission functions.
@@ -1515,6 +1516,7 @@ class scattering_matrix:
             subslicing=subslicing,
             showProgress=self.show_Progress,
             batch_size=batch_size,
+            progress_callback=progress_callback,
         )
 
     def Propagate(
@@ -1526,6 +1528,7 @@ class scattering_matrix:
         batch_size=3,
         showProgress=True,
         transpose=False,
+        progress_callback=None,
     ):
         """
         Propagate a scattering matrix to slice nslice of the specimen.
@@ -1577,39 +1580,48 @@ class scattering_matrix:
                     dtype=self.dtype,
                     device=self.device
                 )
-            for ibeam in range(self.nbeams):
-                # Initialize S-matrix to plane-waves
-                psi = torch.from_numpy(
-                    plane_wave_illumination(
-                        self.gridshape,
-                        self.rsize[:2],
-                        self.eV,
-                        tilt=[self.beams[0][ibeam], self.beams[1][ibeam]],
-                        tilt_units="pixels",
-                        qspace=True,
+            if self.Fourier_space_output:
+                for ibeam in range(self.nbeams):
+                    psi = torch.from_numpy(
+                        plane_wave_illumination(
+                            self.gridshape, self.rsize[:2], self.eV,
+                            tilt=[self.beams[0][ibeam], self.beams[1][ibeam]],
+                            tilt_units="pixels", qspace=True,
+                        )
                     )
-                )
-
-                # Adjust intensity for correct normalization of S matrix rows
-                # taking into account the PRISM factor that needs to be applied
-                # when the Smatrix is evaluated (only 1/product(PRISM_factor)
-                # beams are taken and only 1/product(PRISM_factor) intensity
-                # is cropped out in real space)
-                psi *= torch.prod(torch.tensor(self.PRISM_factor, dtype=self.dtype))
-
-                if self.Fourier_space_output:
+                    psi *= torch.prod(torch.tensor(self.PRISM_factor, dtype=self.dtype))
                     self.S[ibeam] = psi[self.bw_mapping[:, 0], self.bw_mapping[:, 1]]
-                    self.S2[ibeam] = psi[
-                        self.beam_mapping[:, 0], self.beam_mapping[:, 1]
-                    ]
-                else:
-                    self.S[ibeam] = fourier_interpolate_torch(
-                        psi,
-                        self.stored_gridshape,
-                        qspace_in=True,
-                        qspace_out=False,
-                        norm="conserve_norm",
+                    self.S2[ibeam] = psi[self.beam_mapping[:, 0], self.beam_mapping[:, 1]]
+                    if progress_callback is not None:
+                        progress_callback("initialize", ibeam + 1, self.nbeams)
+            else:
+                # A pixel-tilted plane wave is a single Fourier coefficient.
+                # Initialize many beams with one batched inverse FFT instead of
+                # calling plane_wave_illumination and an FFT per beam.
+                ny, nx = map(int, self.gridshape)
+                amplitude = np.sqrt(ny * nx) * np.prod(self.PRISM_factor)
+                for first in range(0, self.nbeams, batch_size):
+                    last = min(first + batch_size, self.nbeams)
+                    count = last - first
+                    psi = torch.zeros(
+                        (count, ny, nx), dtype=torch.complex128, device=self.device
                     )
+                    rows = torch.arange(count, device=self.device)
+                    by = torch.as_tensor(
+                        np.asarray(self.beams[0][first:last]) % ny,
+                        device=self.device, dtype=torch.long,
+                    )
+                    bx = torch.as_tensor(
+                        np.asarray(self.beams[1][first:last]) % nx,
+                        device=self.device, dtype=torch.long,
+                    )
+                    psi[rows, by, bx] = amplitude
+                    self.S[first:last] = fourier_interpolate_torch(
+                        psi, self.stored_gridshape, qspace_in=True,
+                        qspace_out=False, norm="conserve_norm",
+                    )
+                    if progress_callback is not None:
+                        progress_callback("initialize", last, self.nbeams)
             self.initialized = True
 
         # Make nslice_ which always accounts of subslices of the structure
@@ -1722,6 +1734,8 @@ class scattering_matrix:
                     output, self.stored_gridshape, norm="conserve_norm"
                 )
                 self.S[beams] = output
+            if progress_callback is not None:
+                progress_callback("propagate", min((i + 1) * batch_size, self.nbeams), self.nbeams)
 
     def PRISM_crop_window(self, win=None, device=None):
         """Calculate 2D array indices of STEM crop window."""

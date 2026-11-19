@@ -10,6 +10,7 @@ allows users to set up simulations faster and easier.
 import numpy as np
 import matplotlib.pyplot as plt  # Added for debugging purposes
 import torch
+import time
 from .py_multislice import (
     make_propagators,
     tqdm_handler,
@@ -48,13 +49,13 @@ from .Ionization import (
     tile_out_ionization_image,
     transition_potential_multislice,
 )
+from .optimized import accumulate_transition_intensity, window_indices
 from .Probe import (
     focused_probe,
     make_contrast_transfer_function,
     plane_wave_illumination,
     convert_tilt_angles,
 )
-from .optimized import accumulate_transition_intensity, window_indices
 
 
 # Pixel sizes that are amenable to FFTs from https://blake.bcm.edu/emanwiki/EMAN2/BoxSize
@@ -2699,6 +2700,10 @@ def EFSTEM_PRISM(
     showProgress=True,
     do_reverse_multislice=True,
     atom_batch_size=4,
+    smatrix_batch_size=128,
+    scan_batch_size=1024,
+    log_callback=None,
+    log_interval=30,
 ):
     """
     Perform a STEM EELS simulation using the PRISM algorithm.
@@ -2779,6 +2784,14 @@ def EFSTEM_PRISM(
     atom_batch_size : int, optional
         Number of target atoms contracted together. Reduce this if GPU memory
         is limited.
+    smatrix_batch_size : int, optional
+        Plane waves propagated together in each scattering-matrix FFT batch.
+    scan_batch_size : int, optional
+        Scan positions evaluated together for each transition.
+    log_callback : callable, optional
+        Receives progress messages during long phases.
+    log_interval : float, optional
+        Minimum seconds between progress messages within a phase.
 
     Returns
     -------
@@ -2791,12 +2804,57 @@ def EFSTEM_PRISM(
     # Choose GPU if available and CPU if not
     device = get_device(device_type)
 
+    if smatrix_batch_size < 1 or scan_batch_size < 1 or atom_batch_size < 1:
+        raise ValueError("batch sizes must be positive")
+
+    def emit(message):
+        if log_callback is not None:
+            if device.type == "cuda":
+                allocated = torch.cuda.memory_allocated(device) / 2**30
+                reserved = torch.cuda.memory_reserved(device) / 2**30
+                message += f" | GPU memory {allocated:.2f} GiB allocated, {reserved:.2f} GiB reserved"
+            log_callback(message)
+
+    def progress_for(name):
+        started = time.perf_counter()
+        last_report = started
+
+        def report(phase, done, total):
+            nonlocal last_report
+            now = time.perf_counter()
+            if done == total or now - last_report >= log_interval:
+                synchronize()
+                now = time.perf_counter()
+                emit(f"{name} {phase}: {done}/{total} beams; {now-started:.1f} s")
+                last_report = now
+        return report
+
+    def atom_progress_for(name):
+        started = time.perf_counter()
+        last_report = started
+
+        def report(done, total):
+            nonlocal last_report
+            now = time.perf_counter()
+            if done == total or now - last_report >= log_interval:
+                synchronize()
+                now = time.perf_counter()
+                emit(f"{name} transitions: {done}/{total} atoms; {now-started:.1f} s")
+                last_report = now
+        return report
+
+    def synchronize():
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+
     if nfph <= 0:
         raise ValueError("nfph must be >= 1")
 
     # Perform autoslicing by default
     if subslices is None:
+        emit("autoslice: selecting subslices")
         subslices = structure.autoslice()
+        emit(f"autoslice: selected {len(subslices)} subslices")
 
     # Calculate grid size in Angstrom
     rsize = np.zeros(3)
@@ -2814,6 +2872,13 @@ def EFSTEM_PRISM(
     tiled_structure = copy.deepcopy(structure).tile(*tiling)
     coords = tiled_structure.atoms[tiled_structure.atoms[:, 3] == Ztarget][:, :3]
     nslices = np.ceil(thicknesses / structure.unitcell[2]).astype(int)
+    total_slices = nslices * len(subslices)
+    emit(
+        f"geometry: grid={tuple(gridshape)}, scan={scan_shape}, "
+        f"targets={len(coords)}, unit_cells={nslices}, "
+        f"subslices={len(subslices)}, slices={total_slices}, "
+        f"smatrix_batch={smatrix_batch_size}, scan_batch={scan_batch_size}"
+    )
 
     # Make ionization transition potentials
     if Hn0s is None:
@@ -2851,6 +2916,8 @@ def EFSTEM_PRISM(
     for ifph in tqdm(
         range(nfph), disable=tdisable, position=0, desc="Frozen phonon iteration"
     ):
+        emit(f"frozen phonon {ifph+1}/{nfph}: preparing propagators and transmissions")
+        precursor_started = time.perf_counter()
 
         P, T = multislice_precursor(
             structure,
@@ -2863,9 +2930,12 @@ def EFSTEM_PRISM(
             dtype=dtype,
             showProgress=False,
         )
+        synchronize()
+        emit(f"frozen phonon {ifph+1}/{nfph}: precursor ready in {time.perf_counter()-precursor_started:.1f} s")
 
         # Scattering matrix 1 propagates probe from surface of specimen to slice of
         # interest
+        emit("S1: initializing incident beams")
         S1 = scattering_matrix(
             rsize,
             P,
@@ -2873,26 +2943,31 @@ def EFSTEM_PRISM(
             0,
             eV,
             app,
-            batch_size=5,
+            batch_size=smatrix_batch_size,
             subslicing=True,
             PRISM_factor=PRISM_factor,
             showProgress=False,
+            progress_callback=progress_for("S1"),
         )
+        emit(f"S1 ready: {S1.nbeams} beams")
 
         # Scattering matrix 2 propagates probe from slice of ionization to exit surface
+        emit("S2: initializing and propagating detector beams")
         S2 = scattering_matrix(
             rsize,
             P,
             T,
-            nslices * len(subslices),
+            total_slices,
             eV,
             det,
-            batch_size=5,
+            batch_size=smatrix_batch_size,
             subslicing=True,
             transposed=True,
             PRISM_factor=PRISM_factor,
             showProgress=False,
+            progress_callback=progress_for("S2"),
         )
+        emit(f"S2 ready: {S2.nbeams} beams")
         # Link the slices and seeds of both scattering matrices
         S1.seed = S2.seed
 
@@ -2924,7 +2999,7 @@ def EFSTEM_PRISM(
                 ).ravel()
             # Normalize scan_array and convert to torch array
             scan_array *= 1 / np.sqrt(np.sum(scan_array.shape[1]))
-            scan_array = torch.from_numpy(scan_array).to(device)
+            scan_array = torch.from_numpy(scan_array).to(device=device, dtype=S1.S.dtype)
 
             if Hn0_crop is None:
                 Hn0_crop = [S1.stored_gridshape[i] // PRISM_factor[i] for i in range(2)]
@@ -2942,15 +3017,25 @@ def EFSTEM_PRISM(
                 fourier_interpolate(Hn0s, Hn0_crop, qspace_in=True, qspace_out=True)
             )
 
-        total_slices = nslices * len(subslices)
         for islice in tqdm(
             range(total_slices), desc="Slice", position=1, disable=tdisable
         ):
+            slice_started = time.perf_counter()
+            subslice = islice % S1.nsubslices
+            atomsinslice = coords[
+                np.logical_and(
+                    coords[:, 2] >= subslice / S1.nsubslices,
+                    coords[:, 2] < (subslice + 1) / S1.nsubslices,
+                ),
+                :2,
+            ]
+            emit(f"slice {islice+1}/{total_slices}: start, {len(atomsinslice)} target atoms")
 
             # Propagate scattering matrices to this slice
             if islice > 0:
                 S1.Propagate(
-                    islice, P, T, subslicing=True, batch_size=5, showProgress=False
+                    islice, P, T, subslicing=True, batch_size=smatrix_batch_size,
+                    showProgress=False, progress_callback=progress_for("S1"),
                 )
                 if do_reverse_multislice:
                     S2.Propagate(
@@ -2958,8 +3043,9 @@ def EFSTEM_PRISM(
                         P,
                         T,
                         subslicing=True,
-                        batch_size=5,
+                        batch_size=smatrix_batch_size,
                         showProgress=False,
+                        progress_callback=progress_for("S2"),
                     )
                 else:
                     S2 = scattering_matrix(
@@ -2969,45 +3055,44 @@ def EFSTEM_PRISM(
                         total_slices - islice,
                         eV,
                         det,
-                        batch_size=5,
+                        batch_size=smatrix_batch_size,
                         subslicing=True,
                         transposed=True,
                         PRISM_factor=PRISM_factor,
                         showProgress=False,
                         seed=S1.seed,
+                        progress_callback=progress_for("S2"),
                     )
+            synchronize()
+            propagated_at = time.perf_counter()
+            emit(f"slice {islice+1}/{total_slices}: matrices ready in {propagated_at-slice_started:.1f} s")
 
             # Flatten indices of second scattering matrix in preparation for
             # indexing
             S2.S = S2.S.reshape(S2.S.shape[0], np.prod(S2.stored_gridshape))
 
-            # Work out which subslice of the crystal unit cell we are in
-            subslice = islice % S1.nsubslices
-
-            # Get list of atoms within this slice
-            atomsinslice = coords[
-                np.logical_and(
-                    coords[:, 2] >= subslice / S1.nsubslices,
-                    coords[:, 2] < (subslice + 1) / S1.nsubslices,
-                ),
-                :2,
-            ]
-
             accumulate_transition_intensity(
                 EFSTEM_compact, S1, S2, atomsinslice, Hn0s, Hn0_crop,
                 scan, scan_array, PRISM_factor, atom_batch_size,
+                scan_batch_size=scan_batch_size,
+                progress_callback=atom_progress_for(f"slice {islice+1}/{total_slices}"),
             )
             # Reshape scattering matrix S2 for propagation
             S2.S = S2.S.reshape((S2.S.shape[0], *S2.stored_gridshape))
+            synchronize()
+            emit(f"slice {islice+1}/{total_slices}: done in {time.perf_counter()-slice_started:.1f} s")
 
     # Expand compact beam output to a dense diffraction grid for each scan point.
+    emit("expanding compact detector output to the 4D datacube")
     EFSTEM_datacube = torch.zeros(
         nprobe_posn, gridshape[0], gridshape[1], dtype=dtype, device=device
     )
     EFSTEM_datacube[:, beam_y_idx, beam_x_idx] = EFSTEM_compact
 
     # Return 4D-STEM datacube with shape (scan_y, scan_x, qy, qx)
-    return (
+    result = (
         EFSTEM_datacube.cpu().numpy().reshape(*scan_shape, gridshape[0], gridshape[1])
         / nfph
     )
+    emit(f"4D datacube ready: shape={result.shape}")
+    return result

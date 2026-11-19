@@ -23,6 +23,8 @@ def window_indices(center, windowsize, gridshape):
 def accumulate_transition_intensity(
     output, S1, S2, atoms, Hn0s, crop, scan, scan_array, prism_factor,
     atom_batch_size=4,
+    scan_batch_size=1024,
+    progress_callback=None,
 ):
     """Add one slice's ionization intensity to ``output`` in place."""
     if len(atoms) == 0:
@@ -38,6 +40,10 @@ def accumulate_transition_intensity(
     s2 = S2.S.reshape(S2.S.shape[0], -1)
     scan_flat = scan.reshape(-1, 2)
     factor = np.asarray(prism_factor)
+    full_scan = np.all(factor == 1)
+    full_window = tuple(crop) == tuple(grid) and grid[0] == grid[1]
+    selected_all = scan_array.to(S1.S.dtype).T if full_scan else None
+    completed = 0
 
     for start in range(0, len(atoms), atom_batch_size):
         positions = np.asarray(atoms[start:start + atom_batch_size])
@@ -55,18 +61,45 @@ def accumulate_transition_intensity(
         ).to(S1.S.dtype)
 
         for i, atom in enumerate(positions):
-            wrapped = np.abs((scan_flat - atom + 0.5) % 1.0 - 0.5)
-            mask = np.all(wrapped <= 1 / factor / 2, axis=1)
-            if not np.any(mask):
-                continue
+            if full_scan:
+                selected = selected_all
+                scan_indices = None
+            else:
+                wrapped = np.abs((scan_flat - atom + 0.5) % 1.0 - 0.5)
+                mask = np.all(wrapped <= 1 / factor / 2, axis=1)
+                if not np.any(mask):
+                    completed += 1
+                    if progress_callback is not None:
+                        progress_callback(completed, len(atoms))
+                    continue
+                selected = scan_array[mask].to(S1.S.dtype).T
+                scan_indices = torch.as_tensor(np.flatnonzero(mask), device=device)
             # Keep only one detector window in memory. Broadcasting it across
             # all atoms and transitions requires several GiB on large grids.
-            s1_window = s1[:, indices[i]]
-            s2_window = s2[:, indices[i]]
-            selected = scan_array[mask].to(S1.S.dtype).T
-            scan_indices = torch.as_tensor(np.flatnonzero(mask), device=device)
+            if full_window:
+                # The crop indices are a permutation of the entire grid.
+                # Reorder the small potential instead of copying both large
+                # scattering matrices for every target atom.
+                s1_window, s2_window = s1, s2
+            else:
+                s1_window = s1[:, indices[i]]
+                s2_window = s2[:, indices[i]]
             for potential in shifted[i]:
-                transition = s2_window @ (s1_window * potential).T
-                waves = transition @ selected
-                intensity = waves.real.square() + waves.imag.square()
-                output[scan_indices] += intensity.T
+                if full_window:
+                    global_potential = torch.empty_like(potential)
+                    global_potential[indices[i]] = potential
+                    weighted_s1 = s1_window * global_potential
+                else:
+                    weighted_s1 = s1_window * potential
+                transition = s2_window @ weighted_s1.T
+                for first in range(0, selected.shape[1], scan_batch_size):
+                    last = min(first + scan_batch_size, selected.shape[1])
+                    waves = transition @ selected[:, first:last]
+                    intensity = waves.real.square() + waves.imag.square()
+                    if full_scan:
+                        output[first:last] += intensity.T
+                    else:
+                        output[scan_indices[first:last]] += intensity.T
+            completed += 1
+            if progress_callback is not None:
+                progress_callback(completed, len(atoms))

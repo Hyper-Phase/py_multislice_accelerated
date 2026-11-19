@@ -1,4 +1,4 @@
-"""Utility functions for outputting data to file."""
+﻿"""Utility functions for outputting data to file."""
 import os
 from matplotlib import pyplot as plt
 from matplotlib.lines import Line2D
